@@ -1,0 +1,302 @@
+package funkin.backend.assets;
+
+import flixel.util.FlxSignal.FlxTypedSignal;
+import funkin.backend.system.MainState;
+import funkin.backend.utils.CoolUtil;
+import haxe.ds.StringMap;
+import haxe.io.Path;
+import lime.text.Font;
+import openfl.text.Font as OpenFLFont;
+import openfl.utils.AssetLibrary;
+import openfl.utils.AssetManifest;
+
+using StringTools;
+#if MOD_SUPPORT
+import sys.FileSystem;
+#end
+
+
+class ModsFolder {
+	/**
+	 * INTERNAL - Only use when editing source mods!!
+	 */
+	@:dox(hide) public static var onModSwitch:FlxTypedSignal<String->Void> = new FlxTypedSignal<String->Void>();
+
+	/**
+	 * Current mod folder. Will affect `Paths`.
+	 */
+	public static var currentModFolder:String = null;
+	/**
+	 * Path to the `mods` folder.
+	 */
+	public static var modsPath:String = "./mods/";
+	public static var extraModsPaths:Array<String> = [];
+	/**
+	 * Path to the `addons` folder.
+	 */
+	public static var addonsPath:String = "./addons/";
+	public static var extraAddonsPaths:Array<String> = [];
+
+	/**
+	 * If accessing a file as assets/data/global/LIB_mymod.hx should redirect to mymod:assets/data/global.hx
+	 */
+	public static var useLibFile:Bool = true;
+
+	/**
+	 * Whenever its the first time mods has been reloaded.
+	 */
+	private static var __firstTime:Bool = true;
+	
+	@:dox(hide) public static var modsListSortCache:StringMap<Array<String>> = new StringMap();
+
+	/**
+	 * Initializes `mods` folder.
+	 */
+	public static function init() {
+		if(!getModsList().contains(Options.lastLoadedMod)) {
+			if(Options.lastLoadedMod != null)
+				Logs.warn("Mod \"" + Options.lastLoadedMod + "\" not found in mods list, switching to base game!");
+			Options.lastLoadedMod = null;
+		}
+	}
+
+	/**
+	 * Switches mod - unloads all the other mods, then load this one.
+	 * @param libName
+	 */
+	public static function switchMod(mod:String) {
+		Options.lastLoadedMod = currentModFolder = mod;
+		reloadMods();
+		if(mod == null) {
+			mod = "(default)";
+		}
+		Logs.traceColored([
+			Logs.logText('Switched to mod: '),
+			Logs.logText(mod, GREEN)
+		], VERBOSE);
+	}
+
+	public static function reloadMods() {
+		if (!__firstTime)
+			FlxG.switchState(new MainState());
+		__firstTime = false;
+	}
+
+	/**
+	 * Loads a mod library from the specified path. Supports folders and zips.
+	 * @param modName Name of the mod
+	 * @param force Whenever the mod should be reloaded if it has already been loaded
+	 */
+	public static function loadModLib(path:String, force:Bool = false, ?modName:String) {
+		#if MOD_SUPPORT
+		for (ext in Flags.ALLOWED_ZIP_EXTENSIONS) {
+			if (!FileSystem.exists('$path.$ext')) continue;
+			return loadLibraryFromZip('$path'.toLowerCase(), '$path.$ext', force, modName);
+		}
+		return loadLibraryFromFolder('$path'.toLowerCase(), '$path', force, modName);
+
+		#else
+		return null;
+		#end
+	}
+
+	public static function getModBasePath(mod:String):String {
+		#if MOD_SUPPORT
+		if (mod == null) return modsPath;
+		for (base in modsFolders()) {
+			if (FileSystem.exists(base + mod) && FileSystem.isDirectory(base + mod)) return base;
+			for (ext in Flags.ALLOWED_ZIP_EXTENSIONS) {
+				if (FileSystem.exists(base + mod + "." + ext)) return base;
+			}
+		}
+		#end
+		return modsPath;
+	}
+
+	public static function getModPath(mod:String):String {
+		return getModBasePath(mod) + mod;
+	}
+
+	public static function getModConfig(mod:String):Map<String, Map<String, String>> {
+		var base = getModBasePath(mod);
+		for (ext in Flags.ALLOWED_ZIP_EXTENSIONS) {
+			var path = base + mod + "." + ext;
+			if (!FileSystem.exists(path))
+				continue;
+
+			var zip = new SysZip(path);
+			for (entry in zip.entries) {
+				if (entry.fileName.toLowerCase() == "data/config/modpack.ini") {
+					var bytes = zip.unzipEntry(entry);
+					return IniUtil.parseString(bytes.getString(0, bytes.length));
+				}
+			}
+			break; // theoretically once it finds a zip mod, it'll stop even if there's no config
+		}
+
+		var filePath = base + mod + "/data/config/modpack.ini";
+		if (FileSystem.exists(filePath))
+			return IniUtil.parseString(sys.io.File.getContent(filePath));
+
+		return [];
+	}
+
+	public static function getModsList(?sortingOptions:ModSortingOptions):Array<String> {
+		var mods:Array<String> = [];
+		#if MOD_SUPPORT
+		if (!FileSystem.exists(modsPath)) FileSystem.createDirectory(modsPath);
+
+		for (base in modsFolders()) collectMods(base, mods);
+		
+		if (sortingOptions != null) {
+		    var sortForge:StringBuf = new StringBuf();
+			for (i in mods) {
+			    sortForge.add(i);
+				sortForge.add("::");
+			}
+
+			sortForge.add(Std.string(sortingOptions.descending ? 1 : 0));
+
+			sortForge.add(sortingOptions.mode);
+			
+			final sortForgePure:String = sortForge.toString();
+
+			if (modsListSortCache.exists(sortForgePure))
+			    mods = modsListSortCache.get(sortForgePure);
+				if (mods.length > 0 && mods[mods.length - 1] == null) mods.pop();
+			else {
+			    ModSortingController.sort(sortingOptions, mods);
+				modsListSortCache.set(sortForgePure, mods);
+			}
+		}
+		#end
+		return mods;
+	}
+
+	#if MOD_SUPPORT
+	static function modsFolders():Array<String> {
+		var folders = [modsPath];
+		for (path in extraModsPaths) {
+			if (path == null || path.length == 0 || folders.contains(path)) continue;
+			folders.push(path);
+		}
+		return folders;
+	}
+
+	static function collectMods(base:String, mods:Array<String>) {
+		if (base == null || base.length == 0 || !FileSystem.exists(base) || !FileSystem.isDirectory(base)) return;
+		var list:Array<String> = null;
+		try list = FileSystem.readDirectory(base) catch (_:Dynamic) return;
+		if (list == null) return;
+		for (modFolder in list) {
+			var isZip = Flags.ALLOWED_ZIP_EXTENSIONS.contains(Path.extension(modFolder));
+			var name = isZip ? Path.withoutExtension(modFolder) : modFolder;
+			var lower = name.toLowerCase();
+			// android leaves these next to the mods
+			if (lower == "mods" || lower == "addons" || lower == "saves" || lower == "obb" || lower == "files" || lower == "cache" || lower == "assets" || lower == "songs" || lower == "data" || lower == "images") continue;
+			if (mods.contains(name)) continue;
+			if (isZip || FileSystem.isDirectory(base + modFolder)) mods.push(name);
+		}
+	}
+	#end
+	public static function getLoadedModsLibs(skipTranslated:Bool = false):Array<IModsAssetLibrary> {
+		var libs = [];
+		for (i in Paths.assetsTree.libraries) {
+			var l = AssetsLibraryList.getCleanLibrary(i);
+			#if TRANSLATIONS_SUPPORT
+			if(skipTranslated && (l is TranslatedAssetLibrary)) continue;
+			#end
+			// No need to check for it being a `ScriptedAssetLibrary`, if `ScriptedAssetLibrary` extends ModsFolderLibrary, which implements `IModsAssetLibrary`
+			// If you have to revert this change then uhhhhh wasn't me, trust 🙏
+			if (/*l is ScriptedAssetLibrary ||*/ l is IModsAssetLibrary) libs.push(cast(l, IModsAssetLibrary));
+		}
+		return libs;
+	}
+	public static function getLoadedMods(skipTranslated:Bool = false):Array<String>
+		return [for (modLib in getLoadedModsLibs(skipTranslated)) modLib.modName];
+
+	public static function prepareLibrary(libName:String, force:Bool = false) {
+		var assets:AssetManifest = new AssetManifest();
+		assets.name = libName;
+		assets.version = 2;
+		assets.libraryArgs = [];
+		assets.assets = [];
+
+		return AssetLibrary.fromManifest(assets);
+	}
+
+	public static function registerFont(font:Font) {
+		var openflFont = new OpenFLFont();
+		@:privateAccess
+		openflFont.__fromLimeFont(font);
+		OpenFLFont.registerFont(openflFont);
+		return font;
+	}
+
+	public static function prepareModLibrary(libName:String, lib:IModsAssetLibrary, force:Bool = false, ?tag:AssetSource) {
+		var openLib = prepareLibrary(libName, force);
+		lib.prefix = 'assets/';
+		@:privateAccess
+		openLib.__proxy = cast(lib, lime.utils.AssetLibrary);
+		if (tag != null) {
+			openLib.tag = tag;
+			cast(lib, lime.utils.AssetLibrary).tag = tag;
+		}
+		return openLib;
+	}
+
+	#if MOD_SUPPORT
+	public static function loadLibraryFromFolder(libName:String, folder:String, force:Bool = false, ?modName:String, ?tag:AssetSource = MODS) {
+		return prepareModLibrary(libName, new ModsFolderLibrary(folder, libName, modName), force, tag);
+	}
+
+	public static function loadLibraryFromZip(libName:String, zipPath:String, force:Bool = false, ?modName:String, ?tag:AssetSource = MODS) {
+		return prepareModLibrary(libName, new ZipFolderLibrary(zipPath, libName, modName), force, tag);
+	}
+	#end
+}
+
+/**
+ * Describes how mods should be sorted when getting the mods list.
+ */
+typedef ModSortingOptions = {
+    /**
+     * Whether or not the list should go in descending order (e.g. `[2, 1, 0]`).
+     */
+    var descending:Bool;
+    /**
+     * The sorting mode to use.
+     */
+    var mode:ModSortingMode;
+}
+
+/**
+ * This class performs the actual sorting for the mods list.
+ */
+class ModSortingController {
+    /**
+     * Sort the mods list, according to the provided sorting options.
+     */
+    public static function sort(sortingOptions:ModSortingOptions, list:Array<String>):Void {
+        switch (sortingOptions.mode) {
+            case ModSortingMode.CLEAN: {}
+            case ModSortingMode.ALPHABETICAL: CoolUtil.sortAlphabetically(list);
+        }
+        if (sortingOptions.descending) list.reverse();
+    }
+}
+
+/**
+ * The mods list can be sorted in all of the ways provided by this enum.
+ */
+enum abstract ModSortingMode(String) {
+    /**
+     * Use the original list received from reading the directory. This may depend
+     * on the current platform, but remains for legacy purposes.
+     */
+    var CLEAN;
+    /**
+     * The list should be in alphabetical order.
+     */
+    var ALPHABETICAL;
+}
